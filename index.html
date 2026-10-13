@@ -1,0 +1,164 @@
+create extension if not exists pgcrypto;
+
+-- Profiles
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text unique not null
+    check (username ~ '^[a-zA-Z0-9_]{4,32}$'),
+  display_name text not null default 'Reralo User',
+  bio text not null default '',
+  avatar_url text,
+  created_at timestamptz not null default now()
+);
+
+-- Conversations
+create table public.conversations (
+  id uuid primary key default gen_random_uuid(),
+  type text not null
+    check (type in ('direct', 'group', 'channel')),
+  title text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+-- Members and roles
+create table public.conversation_members (
+  conversation_id uuid references public.conversations(id)
+    on delete cascade,
+  user_id uuid references auth.users(id)
+    on delete cascade,
+  role text not null default 'member'
+    check (role in ('owner', 'admin', 'member')),
+  joined_at timestamptz not null default now(),
+  primary key (conversation_id, user_id)
+);
+
+-- Messages
+create table public.messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null
+    references public.conversations(id) on delete cascade,
+  sender_id uuid not null default auth.uid()
+    references auth.users(id),
+  body text not null check (char_length(body) <= 10000),
+  message_type text not null default 'text'
+    check (message_type in ('text', 'image', 'video', 'file', 'voice')),
+  created_at timestamptz not null default now(),
+  edited_at timestamptz,
+  deleted_at timestamptz
+);
+
+create index messages_chat_time_idx
+  on public.messages (conversation_id, created_at desc);
+
+create index members_user_idx
+  on public.conversation_members (user_id, conversation_id);
+
+-- Create a profile automatically after signup
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  chosen_username text;
+begin
+  chosen_username :=
+    lower(coalesce(
+      new.raw_user_meta_data ->> 'username',
+      'user_' || substr(new.id::text, 1, 12)
+    ));
+
+  insert into public.profiles (id, username, display_name)
+  values (
+    new.id,
+    chosen_username,
+    coalesce(
+      nullif(new.raw_user_meta_data ->> 'display_name', ''),
+      'Reralo User'
+    )
+  );
+
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+after insert on auth.users
+for each row execute function public.handle_new_user();
+
+-- Enable row-level security
+alter table public.profiles enable row level security;
+alter table public.conversations enable row level security;
+alter table public.conversation_members enable row level security;
+alter table public.messages enable row level security;
+
+-- Profiles: signed-in users can find profiles
+create policy "Signed-in users can view profiles"
+on public.profiles for select to authenticated
+using (true);
+
+create policy "Users can update their own profile"
+on public.profiles for update to authenticated
+using (id = (select auth.uid()))
+with check (id = (select auth.uid()));
+
+-- Conversations: members only
+create policy "Members can view conversations"
+on public.conversations for select to authenticated
+using (
+  exists (
+    select 1 from public.conversation_members m
+    where m.conversation_id = id
+      and m.user_id = (select auth.uid())
+  )
+);
+
+create policy "Authenticated users can create conversations"
+on public.conversations for insert to authenticated
+with check (created_by = (select auth.uid()));
+
+-- Members can view membership of their own chats
+create policy "Members can view chat membership"
+on public.conversation_members for select to authenticated
+using (
+  exists (
+    select 1 from public.conversation_members mine
+    where mine.conversation_id = conversation_id
+      and mine.user_id = (select auth.uid())
+  )
+);
+
+-- Users can join a conversation they create.
+-- Do not expose unrestricted membership inserts to clients.
+
+create policy "Members can read messages"
+on public.messages for select to authenticated
+using (
+  exists (
+    select 1 from public.conversation_members m
+    where m.conversation_id = messages.conversation_id
+      and m.user_id = (select auth.uid())
+  )
+);
+
+create policy "Members can send messages as themselves"
+on public.messages for insert to authenticated
+with check (
+  sender_id = (select auth.uid())
+  and exists (
+    select 1 from public.conversation_members m
+    where m.conversation_id = messages.conversation_id
+      and m.user_id = (select auth.uid())
+  )
+);
+
+create policy "Senders can edit their own messages"
+on public.messages for update to authenticated
+using (sender_id = (select auth.uid()))
+with check (sender_id = (select auth.uid()));
+
+-- Enable realtime delivery for messages
+alter publication supabase_realtime
+add table public.messages;
